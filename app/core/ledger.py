@@ -98,6 +98,11 @@ def transactional(db: Session) -> Iterator[None]:
     """
     try:
         yield
+        # 业务对象先取得主键，再投影统一账本事件；投影失败也会回滚整个业务事务。
+        db.flush()
+        from app.core.ledger_projection import project_pending_ledger_events
+
+        project_pending_ledger_events(db)
         db.commit()
     except Exception:
         db.rollback()

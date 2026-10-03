@@ -86,6 +86,7 @@ from app.core.ledger import (
     locked_accounts,
     transactional,
 )
+from app.core.ledger_projection import record_state_event
 from app.models.allowance import AllowanceAccount, AllowanceTransaction
 from app.models.auction import (
     AuctionAuditLog,
@@ -603,10 +604,20 @@ def cancel_session(
                         .execution_options(synchronize_session=False)
                     )
 
+                    # 条件 UPDATE 不会出现在 ORM dirty 集合中，显式记录本场次报价终态。
+                    for bid_ref in (
+                        db.query(AuctionBid)
+                        .filter(AuctionBid.session_id == session_id)
+                        .order_by(AuctionBid.id.asc())
+                        .all()
+                    ):
+                        record_state_event(db, bid_ref)
+
                     session = _get_session(db, session_id)
                     session.cancel_reason = reason
                     session.cancelled_by = operator.id if operator else None
                     session.cancelled_at = datetime.utcnow()
+                    record_state_event(db, session)
                     write_audit(
                         db, operator, "session.cancel",
                         target_type="session", target_id=session_id, session_id=session_id,
@@ -811,6 +822,11 @@ def cancel_bid(
                 )
                 if result.rowcount != 1:
                     raise AuctionError("报价状态已变化，撤单失败，请刷新后重试")
+
+                # 条件 UPDATE 绕过 ORM dirty 集合；显式写状态事件，保证撤单重试
+                # 后仍能按 auction_bid:<id>:cancelled 追踪到终态。
+                bid = _get_bid(db, bid_id)
+                record_state_event(db, bid)
 
                 # 卖出报价占用的配额当场释放回自由可用（买入报价无占用）
                 if bid.side == _SELL:
@@ -1017,10 +1033,18 @@ def run_matching(db: Session, session_id: int, operator: Operator | None) -> Auc
                             .values(status=BID_UNMATCHED, matched_at=now)
                             .execution_options(synchronize_session=False)
                         )
+                        for bid_ref in (
+                            db.query(AuctionBid)
+                            .filter(AuctionBid.session_id == session_id)
+                            .order_by(AuctionBid.id.asc())
+                            .all()
+                        ):
+                            record_state_event(db, bid_ref)
                         session = _get_session(db, session_id)
                         session.matched_at = now
                         session.clear_price = None
                         session.matched_volume = 0
+                        record_state_event(db, session)
                         write_audit(
                             db, operator, "session.match",
                             target_type="session", target_id=session_id, session_id=session_id,
@@ -1109,6 +1133,7 @@ def run_matching(db: Session, session_id: int, operator: Operator | None) -> Auc
                     session.matched_volume = total_volume
                     session.trade_count = len(trades)
                     session.matched_at = now
+                    record_state_event(db, session)
                     write_audit(
                         db, operator, "session.match",
                         target_type="session", target_id=session_id, session_id=session_id,
@@ -1233,6 +1258,7 @@ def settle_session(db: Session, session_id: int, operator: Operator | None) -> A
                             # 条件 UPDATE 抢占落 settled（循环内 expire_all + 流水
                             # 反向引用会使 ORM 赋值丢失，数据库更新是唯一可靠路径）。
                             _mark_trade_settled(db, trade.id)
+                            record_state_event(db, db.get(AuctionTrade, trade.id))
                             buyer_ids.add(trade.buyer_id)
 
                         # 成交单状态为 ORM 赋值，autoflush=False 的调用方下后续查询
@@ -1263,6 +1289,7 @@ def settle_session(db: Session, session_id: int, operator: Operator | None) -> A
 
                         session = _get_session(db, session_id)
                         session.settled_at = datetime.utcnow()
+                        record_state_event(db, session)
                         write_audit(
                             db, operator, "session.settle",
                             target_type="session", target_id=session_id, session_id=session_id,
@@ -1406,6 +1433,7 @@ def _rollback_buyer_compliance(
         .execution_options(synchronize_session=False)
     )
     db.expire_all()
+    record_state_event(db, db.get(ComplianceRecord, record.id))
 
     if emission <= 0 or new_deficit <= 0:
         _set_quota_status(db, buyer_id, year, "cleared")
@@ -1599,6 +1627,7 @@ def reverse_settled_trades(
                             )
                             .execution_options(synchronize_session=False)
                         )
+                        record_state_event(db, db.get(AuctionTrade, trade.id))
                         trade.reversed_quantity = new_reversed
                         trade.defaulted_amount = new_defaulted
                         trade.status = new_status
@@ -1728,6 +1757,7 @@ def _apply_one_repayment(
         .values(repaid_amount=new_repaid, status=new_status)
         .execution_options(synchronize_session=False)
     )
+    record_state_event(db, db.get(AuctionTrade, trade.id))
     trade.repaid_amount = new_repaid
     trade.status = new_status
 

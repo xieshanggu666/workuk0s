@@ -44,6 +44,7 @@ from app.core.ledger import (
     trade_order_key,
     transactional,
 )
+from app.core.ledger_projection import record_state_event
 from app.models.allowance import (
     AllowanceAccount,
     AllowanceTransaction,
@@ -365,6 +366,7 @@ def cancel_order(db: Session, order_id: int, company_id: int, reason: str = "") 
                 if _transit_status(db, order_id, _ACTIVE_STATUSES, CANCELLED) != 1:
                     # 并发下被另一事务抢先交割/撤销：整体回滚并提示
                     raise TradeOrderError("订单状态已变化，撤销失败，请刷新后重试")
+                record_state_event(db, _get_order(db, order_id))
 
                 if was_confirmed:
                     lock_row_for_write(db, seller_account.id)
@@ -429,6 +431,7 @@ def deliver_order(db: Session, order_id: int, company_id: int) -> TradeOrder:
                 # 状态抢占：并发撤销/交割时只有一个事务能把 confirmed → delivered
                 if _transit_status(db, order_id, (CONFIRMED,), DELIVERED) != 1:
                     raise TradeOrderError("订单状态已变化，交割失败，请刷新后重试")
+                record_state_event(db, _get_order(db, order_id))
 
                 seller_account = lock_row_for_write(db, seller_account.id)
                 buyer_account = lock_row_for_write(db, buyer_account.id)

@@ -22,6 +22,7 @@ from app.models.emission import (
     EmissionResult,
     FactorVersion,
 )
+from app.models.ledger import LedgerEvent
 from app.models.report import MrvReport
 from app.models.user import User
 
@@ -46,5 +47,6 @@ __all__ = [
     "AuctionReversalBatch",
     "AuctionDefaultRepayment",
     "AuctionAuditLog",
+    "LedgerEvent",
     "MrvReport",
 ]

@@ -6,7 +6,7 @@
 
 - **后端**：Python 3.10+ / FastAPI / SQLAlchemy ORM / SQLite / JWT（Cookie 认证）
 - **前端**：React 18（本地 UMD 运行时 + htm 模板引擎，无需构建工具，完全离线可用）
-- **测试**：pytest（218 项全部通过，含多线程并发、交割/结算闭环与冲正/违约回退一致性测试）
+- **测试**：pytest（覆盖多线程并发、交割/结算闭环、冲正/违约回退一致性与统一账本重放/对账）
 
 ## 快速开始
 
@@ -19,6 +19,8 @@ uvicorn app.main:app --reload  # 启动服务
 > 升级旧库（新增幂等键列与唯一约束）：`python scripts/migrate_concurrency.py`，可重复执行。
 >
 > 已结算竞价冲正/违约回退链路升级（新增 3 张表与成交单冲正/违约列、场次自动追偿开关）：`python scripts/migrate_auction_reversal.py`，可重复执行。
+>
+> 统一账本重放/对账升级（新增 `ledger_events` 事件表，旧流水与当前订单/竞价/履约状态自动回填）：`python scripts/migrate_ledger_replay.py`，可重复执行。
 
 访问 http://127.0.0.1:8000
 
@@ -70,9 +72,19 @@ uvicorn app.main:app --reload  # 启动服务
 - **重复提交**：流水、履约记录与订单均支持幂等键（请求体 `idempotency_key` 或 `Idempotency-Key` 请求头），双击 / 超时重试只入账一次；前端提交期间禁用按钮并自动生成幂等键
 - **数据库兜底约束**：`quotas` 的 (企业, 年度) 唯一约束防止并发分配重复；活跃 `compliance_records` 的 (企业, 年度) 部分唯一索引允许冲正归档后重新批准；`trade_orders` 幂等键唯一约束防止重复挂单
 
-## 数据表（21 张）
 
-`users` `companies` `emission_scopes` `activity_data` `emission_factors` `factor_versions` `calculation_methods` `emission_results` `quotas` `allowance_accounts` `allowance_transactions` `compliance_records` `mrv_reports` `trade_orders` `auction_sessions` `auction_bids` `auction_trades` `auction_trade_reversals` `auction_reversal_batches` `auction_default_repayments` `auction_audit_logs`
+### 统一账本事件、重放与对账
+
+- **只追加事件日志**：新增 `ledger_events`，每笔 `allowance_transactions` 投影为 `movement` 事件并展开持仓/冻结/占用带符号增量；订单、竞价场次/报价/成交、履约/报告、冲正批次和违约追偿投影为 `state` 事件。冲正不覆盖原事件，而是用补偿/追偿事件完整串联。
+- **幂等与并发重试**：事件键由业务主键/状态确定性生成（如 `allowance_transaction:<id>`、`auction_trade:<id>:reversed`），事件与业务流水在同一事务提交；双击、超时重试、重复迁移、并发条件 UPDATE 都不会产生重复事件。
+- **旧记录兼容**：`migrate_ledger_replay.py` 不改写旧流水，只回填旧 movement/current-state 事件；旧 `opening_balance` 中无法由 allocation 解释的部分补 `legacy_opening_balance`，使旧库也能从零重放。
+- **可追溯链路**：`trace_key` 支持按订单、竞价成交或企业年度串起“占用/到账 → 清缴 → 冲正退还/收回 → 违约追偿”全链路；部分冲正按成交单累计，跨年度按 `company_id + year` 与年度账户硬隔离。
+- **重放/对账**：`GET /api/ledger/replay` 从事件重建 current/frozen/reserved；`GET /api/ledger/reconcile` 校验事件投影完整性、事件快照链、账户三余额不变量、履约恒等式、订单/竞价状态与出入账量、部分冲正和追偿累计、跨年度事件归属。
+
+
+## 数据表（22 张）
+
+`users` `companies` `emission_scopes` `activity_data` `emission_factors` `factor_versions` `calculation_methods` `emission_results` `quotas` `allowance_accounts` `allowance_transactions` `compliance_records` `mrv_reports` `trade_orders` `auction_sessions` `auction_bids` `auction_trades` `auction_trade_reversals` `auction_reversal_batches` `auction_default_repayments` `auction_audit_logs` `ledger_events`
 
 ## API 摘要
 
@@ -116,11 +128,15 @@ uvicorn app.main:app --reload  # 启动服务
 | POST | `/api/auctions/trades/{id}/repay` | 监管对单笔违约成交手动追偿（amount 缺省为全额，尽力而为） |
 | POST | `/api/auctions/defaults/{buyer_id}/recover?year=` | 监管按买方某年度汇总追偿全部欠额 |
 | GET | `/api/auctions/audit-logs` | 权限与操作审计（admin/verifier，越权读取 403 并留痕） |
+| GET | `/api/ledger/events` | 查询统一账本事件（支持企业/年度/账户/trace/ref/kind 过滤） |
+| GET | `/api/ledger/replay` | 从事件重放账户持仓、冻结与占用 |
+| GET | `/api/ledger/reconcile` | 统一对账（默认幂等补齐旧事件投影，返回差异清单） |
+| POST | `/api/ledger/backfill` | 监管显式回填旧账事件（可重复执行） |
 
 ## 测试
 
 ```bash
-python -m pytest tests/ -v   # 218 passed
+python -m pytest tests/ -v
 ```
 
 覆盖：核算引擎两种公式、因子按年取值、核算幂等、配额分配幂等、清缴达标/缺口与补缴、交易余额校验、MRV 状态机、API 冒烟、越权防护、企业间订单全状态机（挂单/单方及双方确认/撤销释放/交割双方入账/幂等与非法流转拒绝），以及多线程并发交易/清缴/订单（无超额扣减、占用与冻结互不挤占、流水三类快照链一致、幂等键去重、失败整体回滚、交割与撤销竞争只有一方成功、清缴与交易并发三方一致）；另有交割联动清缴闭环专项测试：足额/部分/超买补缴、纯冻结记录核销、关闭联动后手动清缴、卖方义务不被触动、重复交割只核销一次、两笔订单交割与手动清缴并发后"余额 / 流水 / 履约记录 / 仪表盘统计"四方一致且年度配额守恒（持仓 + 已清缴 = 分配总量）。
