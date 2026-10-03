@@ -25,6 +25,11 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
+# 统一账本事件钩子：任何会话新写入的配额流水都自动同事务登记为账本事件
+from app.core.event_hooks import install_ledger_hooks  # noqa: E402
+
+install_ledger_hooks(SessionLocal)
+
 
 def get_db():
     db = SessionLocal()

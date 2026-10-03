@@ -14,13 +14,16 @@ os.environ.setdefault("CARBON_DATABASE_URL", f"sqlite:///{_tmp_dir}/pytest.db")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.database import Base  # noqa: E402
+from app.core.event_hooks import install_ledger_hooks  # noqa: E402
 
 
 @pytest.fixture()
 def db():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+    TestSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    install_ledger_hooks(TestSession)
+    session = TestSession()
     yield session
     session.close()
 

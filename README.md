@@ -6,7 +6,7 @@
 
 - **后端**：Python 3.10+ / FastAPI / SQLAlchemy ORM / SQLite / JWT（Cookie 认证）
 - **前端**：React 18（本地 UMD 运行时 + htm 模板引擎，无需构建工具，完全离线可用）
-- **测试**：pytest（218 项全部通过，含多线程并发、交割/结算闭环与冲正/违约回退一致性测试）
+- **测试**：pytest（250 项全部通过，含多线程并发、交割/结算闭环与冲正/违约回退一致性，以及统一账本事件链重放与对账专项）
 
 ## 快速开始
 
@@ -19,6 +19,8 @@ uvicorn app.main:app --reload  # 启动服务
 > 升级旧库（新增幂等键列与唯一约束）：`python scripts/migrate_concurrency.py`，可重复执行。
 >
 > 已结算竞价冲正/违约回退链路升级（新增 3 张表与成交单冲正/违约列、场次自动追偿开关）：`python scripts/migrate_auction_reversal.py`，可重复执行。
+>
+> **统一账本重放/对账链路升级（新增 3 张账本表：事件流/检查点/对账记录，并把五类旧业务记录回填为可重放事件）**：`python scripts/migrate_ledger_replay.py`，可重复执行。
 
 访问 http://127.0.0.1:8000
 
@@ -49,6 +51,16 @@ uvicorn app.main:app --reload  # 启动服务
 9. **MRV 报告**：年度范围一二三汇总生成，草稿 → 提交 → 批准状态流转；已批准报告不得直接覆盖，须由监管/核查角色通过冲正接口异常回滚；**批准前双重拦截**：该企业年度仍有未核验活动数据将被拒绝；报告排放快照与最新核算合计不一致（核验重算后未重新生成报告）同样拒绝，防止旧快照污染配额冻结与履约结果
 10. **碳配额集中竞价市场**：监管建场（草稿/开放）→ 买/卖方企业密封报价（卖出报价即占用可用配额）→ 监管统一撮合（最大成交量定价、价格-时间优先、自成交规避）→ 集中结算（双方配额账户与流水同事务落账并核销买方履约缺口）；支持撤单、撮合前/后撤场（逐级释放占用）、并发结算抢占、全场次操作与越权拒绝审计；**已结算成交支持监管冲正与违约回退**（见下）
 11. **已结算成交监管冲正 / 违约回退**：监管可对已结算成交单做整笔、批量或部分数量冲正，同一事务内回退双方配额划转、按成交单流水归属精确回滚联动清缴（退还到账补缴）、同步回退履约清缴记录与配额状态并写冲正单/批次与审计；买方自由可用不足时只收回可得部分、不足登记为违约欠额（成交单 `defaulted`），买方可由监管手动追偿或在后续场次结算到账后自动追偿（`auto_recover_default`，先清缴后追偿），欠额结清后成交单转为 `reversed`；冲正批次与补缴均有幂等键，并发重复操作只生效一次；**与报告冲正顺序无关**：两条回退链路共用同一本成交单归属流水账（`auction_deficit_clear` − `auction_clear_refund`），同一吨到账补缴无论先冲报告还是先冲成交最多退还一次，系统总配额守恒
+12. **统一账本事件链 · 重放 · 对账**：配额流水、企业订单、集中竞价、履约清缴与冲正回退五类业务统一投影到一条只追加（append-only）的事件账（`ledger_events`，全局 `seq` 全序 + SHA-256 链式哈希），任何业务回退都以追加反向补偿事件体现，不删改旧事件；每笔流水在**同一事务**内由会话钩子自动登记事件（同生共死），旧库五类业务记录可由迁移脚本幂等回填为 `is_legacy=1` 历史事件（含订单/场次/报价/成交单/履约/报告/冲正批次/违约追偿的状态时点）；账户投影支持全量重放与检查点增量重放（`ledger_checkpoints`），重放器逐笔核对落账三余额快照；对账器（`ledger_reconciliations`，每次运行可追溯、幂等重跑）做六维核对：① 事件链完整性（断序/断链/篡改）② 重放投影 vs 实际余额与账本不变量 ③ 期初+有符号流水勾稽与逐笔快照链 ④ 单据↔账本（占用必释放或出库、交割配对、冲正累计≤成交量、违约欠额=追偿、补缴不超额退还）⑤ 履约一致（清缴/冻结/缺口/配额状态/报告归档）⑥ 系统守恒（跨主体出入账两两相等、逐年度总配额恒等）；账户按（企业, 年度）开立、余额事件强制带年度，逐年度独立重放，跨年度不串账
+
+### 统一账本事件链与对账设计要点
+
+- **单一语义事实来源**（`app/core/event_semantics.py`）：20+ 种流水类型对（持仓/冻结/占用）的有符号投影规则集中登记一次，事件登记器、重放器、对账器全部引用同一张表，杜绝“业务记账一套语义、重放又是另一套”；未登记的历史类型降级为 `unknown` 并按 warning 披露，不阻断重放
+- **事件即业务的同事务投影**：不在四个业务服务里手工埋点，而挂 SQLAlchemy 会话 `after_flush` 钩子——流水拿到主键后在同一轮 flush 内追加事件，业务回滚则事件 INSERT 一并回滚；事件按流水主键排序登记，保证同一账户逐笔快照链顺序确定。序号由进程锁 + `(source,source_ref,occurrence)` 与 `seq` 唯一约束双保险，双击/超时重试/并发回填同一业务事实只登记一次
+- **可重放**：`replay_all/replay_account` 从空投影按 `seq` 应用事件得到账户余额；`ledger_checkpoints` 保存最近投影供增量重放，是可随时丢弃重建的派生数据；事件 `payload` 带落账时持仓/冻结/占用三快照，重放逐笔校验，旧记录快照不符按 warning、新事件不符按 error
+- **可对账**：`POST /api/ledger/reconcile`（仅监管，支持 `Idempotency-Key`）做只读全量/企业/年度对账，差异结构化（code/severity/refs）落 `ledger_reconciliations`，系统守恒结论随运行持久化；库外篡改余额、物理删除事件、篡改事件载荷分别触发投影不符 / 断序断链 / 哈希不符
+- **兼容旧记录**：`scripts/migrate_ledger_replay.py` 建表 + 幂等回填（实时记账库上只补缺、零重复）+ 重建检查点，回填后对账结论与实时记账一致；回填事件与升级后的实时事件共用同一条哈希链（旧事件在前、新事件勾连其后）
+- **跨年度状态一致性**：所有余额事件强制带 `year`，缺失即对账报错；订单/成交单年度与其流水账户年度不一致报 `CROSS_YEAR_*`；每个（企业, 年度）独立重放与守恒校验
 
 ### 集中竞价市场设计要点
 
@@ -70,9 +82,9 @@ uvicorn app.main:app --reload  # 启动服务
 - **重复提交**：流水、履约记录与订单均支持幂等键（请求体 `idempotency_key` 或 `Idempotency-Key` 请求头），双击 / 超时重试只入账一次；前端提交期间禁用按钮并自动生成幂等键
 - **数据库兜底约束**：`quotas` 的 (企业, 年度) 唯一约束防止并发分配重复；活跃 `compliance_records` 的 (企业, 年度) 部分唯一索引允许冲正归档后重新批准；`trade_orders` 幂等键唯一约束防止重复挂单
 
-## 数据表（21 张）
+## 数据表（24 张）
 
-`users` `companies` `emission_scopes` `activity_data` `emission_factors` `factor_versions` `calculation_methods` `emission_results` `quotas` `allowance_accounts` `allowance_transactions` `compliance_records` `mrv_reports` `trade_orders` `auction_sessions` `auction_bids` `auction_trades` `auction_trade_reversals` `auction_reversal_batches` `auction_default_repayments` `auction_audit_logs`
+`users` `companies` `emission_scopes` `activity_data` `emission_factors` `factor_versions` `calculation_methods` `emission_results` `quotas` `allowance_accounts` `allowance_transactions` `compliance_records` `mrv_reports` `trade_orders` `auction_sessions` `auction_bids` `auction_trades` `auction_trade_reversals` `auction_reversal_batches` `auction_default_repayments` `auction_audit_logs` `ledger_events` `ledger_checkpoints` `ledger_reconciliations`
 
 ## API 摘要
 
@@ -116,11 +128,18 @@ uvicorn app.main:app --reload  # 启动服务
 | POST | `/api/auctions/trades/{id}/repay` | 监管对单笔违约成交手动追偿（amount 缺省为全额，尽力而为） |
 | POST | `/api/auctions/defaults/{buyer_id}/recover?year=` | 监管按买方某年度汇总追偿全部欠额 |
 | GET | `/api/auctions/audit-logs` | 权限与操作审计（admin/verifier，越权读取 403 并留痕） |
+| GET | `/api/ledger/events` | 统一账本事件链时间线（游标分页，企业仅本企业；含逐笔持仓/冻结/占用演化） |
+| GET | `/api/ledger/accounts/{id}/replay` | 单账户全量重放投影 vs 实际余额（企业仅本企业账户） |
+| POST | `/api/ledger/reconcile` | 发起全量/企业/年度对账（admin/verifier，支持 Idempotency-Key） |
+| GET | `/api/ledger/reconciliations` `/…/{id}` | 对账运行历史/详情（企业仅见本企业范围结论） |
+| POST | `/api/ledger/backfill` | 旧五类业务记录回填进事件链并重建检查点（仅 admin，幂等可重跑） |
+| POST | `/api/ledger/checkpoints/rebuild` | 全量重放重建账户检查点（仅 admin） |
+| GET | `/api/ledger/chain/head` | 事件链头部锚点（head seq / 实时与历史事件数） |
 
 ## 测试
 
 ```bash
-python -m pytest tests/ -v   # 218 passed
+python -m pytest tests/ -v   # 250 passed
 ```
 
 覆盖：核算引擎两种公式、因子按年取值、核算幂等、配额分配幂等、清缴达标/缺口与补缴、交易余额校验、MRV 状态机、API 冒烟、越权防护、企业间订单全状态机（挂单/单方及双方确认/撤销释放/交割双方入账/幂等与非法流转拒绝），以及多线程并发交易/清缴/订单（无超额扣减、占用与冻结互不挤占、流水三类快照链一致、幂等键去重、失败整体回滚、交割与撤销竞争只有一方成功、清缴与交易并发三方一致）；另有交割联动清缴闭环专项测试：足额/部分/超买补缴、纯冻结记录核销、关闭联动后手动清缴、卖方义务不被触动、重复交割只核销一次、两笔订单交割与手动清缴并发后"余额 / 流水 / 履约记录 / 仪表盘统计"四方一致且年度配额守恒（持仓 + 已清缴 = 分配总量）。
@@ -128,3 +147,5 @@ python -m pytest tests/ -v   # 218 passed
 集中竞价市场专项（`test_auction.py` / `test_auction_api.py`，46 项）：场次草稿/开放/撮合/结算状态机与幂等建场；密封报价保留价校验、同企业同方向唯一、卖出超可用拒绝、撤单释放；统一价格撮合的最大成交量/未匹配量/均价并列规则、价格-时间优先、部分成交、零成交、自成交规避、卖出按可用封顶且未成交余量释放；结算双方划转与流水五快照链守恒、买方缺口足额/部分/超买联动核销、关闭联动留存缺口；撮合后撤场逐笔释放、开放期撤场批量释放报价占用；多线程并发结算只划转一次、结算与撤场竞争恰一方胜出、跨场次并发卖出总占用不超过自由可用、结算与手动清缴并发守恒；API 角色边界（企业/核查/监管）、越权撤单与越权读审计的拒绝留痕、HTTP 并发结算幂等。
 
 冲正与违约回退专项（`test_auction_reversal.py` / `test_auction_reversal_api.py`，39 项）：无联动清缴的整笔/批量/部分数量冲正及重复冲正拒绝、幂等键去重；冲正按成交单归属精确回滚到账补缴、履约记录 cleared/deficit 与配额状态同步回退、部分冲正保持 settled 且可分次冲正至 reversed；买方配额已转出时冲正只收回自由可用余额、差额登记违约欠额与卖方待追偿敞口，监管逐笔/按买方手动追偿（受自由可用约束、超额自动封顶、无可用拒绝）、后续场次结算到账同事务自动追偿、关闭 `auto_recover_default` 不追偿，欠额结清后 defaulted → reversed；多线程并发冲正只生效一次、并发部分冲正累计不超过成交量、冲正与下一场结算自动追偿并发不超额；**报告冲正与成交冲正四种先后/交错顺序下归属补缴不重复退还、系统总配额守恒**，报告冲正→重新批准→冲正旧成交不污染新履约记录；流水三快照链与配额守恒；API 角色边界（仅 admin 可冲正/追偿、企业越权 403 并审计）、HTTP 并发冲正幂等、冲正/追偿审计留痕。
+
+统一账本重放与对账专项（`test_ledger_replay.py` / `test_ledger_api.py`，32 项）：分配/订单/竞价/冲正/违约全链路每笔流水同事务生成事件、事务回滚事件同灭、事件 seq 连续与哈希链勾连；全量/增量重放投影与账户三余额一致、检查点重建往返、跨年度账户独立投影；旧库清空事件链后从五类业务表幂等回填（重放结论不变、重复回填零新增、回填后实时记账不重复）；部分冲正与违约自动追偿后对账平衡、系统守恒；库外篡改余额、物理删除事件、篡改事件载荷分别被投影/断序断链/内容哈希核对检出；多线程并发交割后链不重号不断链且账实相符；API 角色边界（对账仅监管、回填仅 admin、企业事件隔离与越权 403）、对账幂等键去重、事件链游标分页。
